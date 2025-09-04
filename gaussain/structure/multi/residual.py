@@ -545,10 +545,12 @@ def combined_loss_function(outputs, targets, k_field_target, loss_weights=None):
         'ssim': ssim_value
     }
 
-def train_residual_fusion_model(X_time_series, head_images, k_field_images, Y,
+
+def train_onestage_fusion_model(X_time_series, head_images, k_field_images, Y,
                                 lstm_path='best_specialized_model.pth',
                                 cnn_path='checkpoints/best_model.pth',
-                                stages=3, epochs_per_stage=30, patience=20, batch_size=32):
+                                epochs=90, patience=30, batch_size=32):
+    # 数据预处理
     scaler_X = StandardScaler()
     scaler_Y = StandardScaler()
     X_np = X_time_series.numpy()
@@ -557,22 +559,28 @@ def train_residual_fusion_model(X_time_series, head_images, k_field_images, Y,
     Y_scaled = scaler_Y.fit_transform(Y_np)
     X_time_series_scaled = torch.tensor(X_scaled, dtype=torch.float32)
     Y_scaled = torch.tensor(Y_scaled, dtype=torch.float32)
+
     train_loader, val_loader, test_loader = create_multimodal_data_loaders(
         X_time_series_scaled, head_images, k_field_images, Y_scaled, batch_size=batch_size)
+
     os.makedirs("checkpoints", exist_ok=True)
     os.makedirs("samples", exist_ok=True)
-    with open("checkpoints/scaler_X_fusion.pkl", "wb") as f:
+
+    # 保存标准化器
+    with open("checkpoints/scaler_X.pkl", "wb") as f:
         pickle.dump(scaler_X, f)
-    with open("checkpoints/scaler_Y_fusion.pkl", "wb") as f:
+    with open("checkpoints/scaler_Y.pkl", "wb") as f:
         pickle.dump(scaler_Y, f)
+
     print("Standard scalers saved")
+
+    # 获取数据维度
     _, sample_head, sample_k, _ = next(iter(train_loader))
     img_size = sample_head.shape[2]
     k_channels = sample_k.shape[1]
     h_channels = sample_head.shape[1]
-    print(f"Image size: {img_size}x{img_size}")
-    print(f"K-field channels: {k_channels}")
-    print(f"Head image channels: {h_channels}")
+
+    # 初始化模型
     model = PretrainedResidualFusionModel(
         lstm_hidden_dim=128,
         cnn_feature_dim=256,
@@ -581,169 +589,190 @@ def train_residual_fusion_model(X_time_series, head_images, k_field_images, Y,
         k_field_channels=k_channels,
         img_size=img_size
     ).to(device)
+
+    # 训练历史记录
     history = {
         'train_total_loss': [], 'train_param_loss': [], 'train_image_loss': [],
         'val_total_loss': [], 'val_param_loss': [], 'val_image_loss': [],
         'lr': [], 'param_fusion_weight': [], 'image_fusion_weight': [],
-        'param_time_series_contrib': [], 'param_image_contrib': [],  # 新增
-        'image_time_series_contrib': [], 'image_image_contrib': []   # 新增
+        'param_time_series_contrib': [], 'param_image_contrib': [],
+        'image_time_series_contrib': [], 'image_image_contrib': []
     }
+
+    # 优化器和学习率调度器
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.7, patience=5, verbose=True, min_lr=1e-6)
+
+    # 损失权重
+    loss_weights = {'param': 0.6, 'image': 0.4, 'loc_weight': 3.0, 'rel_weight': 1.0}
+
     best_val_loss = float('inf')
     best_model_state = None
-    for stage in range(stages):
-        print(f"\n===== Stage {stage + 1}/{stages} =====")
-        requires_grad = {
-            'lstm_encoder': stage >= 2,
-            'cnn_encoder': stage >= 1,
-            'param_network': True,
-            'k_field_decoder': True,
-            'fusion_modules': True
+    waiting = 0
+
+    print("Starting one-stage training with all parameters unfrozen")
+
+    def safe_item(tensor):
+        if isinstance(tensor, torch.Tensor) and tensor.numel() == 1:
+            return tensor.item()
+        return tensor
+
+    for epoch in range(epochs):
+        # 训练阶段
+        model.train()
+        train_losses = {'total': 0.0, 'param': 0.0, 'image': 0.0}
+        fusion_weights = {'param': 0.0, 'image': 0.0}
+        contribs = {
+            'param_ts': 0.0, 'param_img': 0.0,
+            'img_ts': 0.0, 'img_img': 0.0
         }
-        for name, param in model.lstm_encoder.named_parameters():
-            param.requires_grad = requires_grad['lstm_encoder']
-        for name, param in model.cnn_encoder.named_parameters():
-            param.requires_grad = requires_grad['cnn_encoder']
-        for name, param in model.param_network.named_parameters():
-            param.requires_grad = requires_grad['param_network']
-        for name, param in model.k_field_decoder.named_parameters():
-            param.requires_grad = requires_grad['k_field_decoder']
-        for name, param in model.param_fusion.named_parameters():
-            param.requires_grad = requires_grad['fusion_modules']
-        for name, param in model.image_fusion.named_parameters():
-            param.requires_grad = requires_grad['fusion_modules']
-        lr = 0.001 / (stage + 1)
-        loss_weights = {'param': 0.8 - 0.1 * stage, 'image': 0.2 + 0.1 * stage, 'loc_weight': 3.0, 'rel_weight': 1.0}
-        print(f"Learning rate: {lr}")
-        print(f"Loss weights: {loss_weights}")
-        print("Trainable parts:")
-        for part, trainable in requires_grad.items():
-            print(f"  {part}: {'✓' if trainable else '✗'}")
-        optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=lr, weight_decay=1e-5)
-        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.7, patience=5, verbose=True, min_lr=1e-6)
-        stage_patience = 0
-        for epoch in range(epochs_per_stage):
-            try:
-                model.train()
-                train_losses = {'total': 0.0, 'param': 0.0, 'image': 0.0}
-                fusion_weights = {'param': 0.0, 'image': 0.0}
-                contribs = {
-                    'param_ts': 0.0, 'param_img': 0.0,
-                    'img_ts': 0.0, 'img_img': 0.0
-                }
-                for btc, head_img, k_field, params in tqdm(train_loader, desc=f"Stage {stage + 1} Epoch {epoch + 1}"):
-                    optimizer.zero_grad()
-                    outputs = model(btc, head_img)
-                    losses = combined_loss_function(outputs, params, k_field, loss_weights)
-                    losses['total_loss'].backward()
-                    nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    optimizer.step()
-                    train_losses['total'] += losses['total_loss'].item()
-                    train_losses['param'] += losses['param_loss'].item()
-                    train_losses['image'] += losses['image_loss'].item()
-                    fusion_weights['param'] += safe_item(outputs['param_fusion_weight'])
-                    fusion_weights['image'] += safe_item(outputs['image_fusion_weight'])
-                    contribs['param_ts'] += safe_item(outputs['param_time_series_contrib'])
-                    contribs['param_img'] += safe_item(outputs['param_image_contrib'])
-                    contribs['img_ts'] += safe_item(outputs['image_time_series_contrib'])
-                    contribs['img_img'] += safe_item(outputs['image_image_contrib'])
-                avg_train_total = train_losses['total'] / len(train_loader)
-                avg_train_param = train_losses['param'] / len(train_loader)
-                avg_train_image = train_losses['image'] / len(train_loader)
-                avg_param_weight = safe_item(fusion_weights['param'] / len(train_loader))
-                avg_image_weight = safe_item(fusion_weights['image'] / len(train_loader))
-                avg_param_ts_contrib = contribs['param_ts'] / len(train_loader)
-                avg_param_img_contrib = contribs['param_img'] / len(train_loader)
-                avg_img_ts_contrib = contribs['img_ts'] / len(train_loader)
-                avg_img_img_contrib = contribs['img_img'] / len(train_loader)
-                history['train_total_loss'].append(avg_train_total)
-                history['train_param_loss'].append(avg_train_param)
-                history['train_image_loss'].append(avg_train_image)
-                history['lr'].append(optimizer.param_groups[0]['lr'])
-                history['param_fusion_weight'].append(avg_param_weight)
-                history['image_fusion_weight'].append(avg_image_weight)
-                history['param_time_series_contrib'].append(avg_param_ts_contrib)
-                history['param_image_contrib'].append(avg_param_img_contrib)
-                history['image_time_series_contrib'].append(avg_img_ts_contrib)
-                history['image_image_contrib'].append(avg_img_img_contrib)
-                model.eval()
-                val_losses = {'total': 0.0, 'param': 0.0, 'image': 0.0, 'ssim': 0.0}
-                val_fusion_weights = {'param': 0.0, 'image': 0.0}
-                val_contribs = {
-                    'param_ts': 0.0, 'param_img': 0.0,
-                    'img_ts': 0.0, 'img_img': 0.0
-                }
-                with torch.no_grad():
-                    for btc, head_img, k_field, params in val_loader:
-                        outputs = model(btc, head_img)
-                        losses = combined_loss_function(outputs, params, k_field, loss_weights)
-                        val_losses['total'] += losses['total_loss'].item()
-                        val_losses['param'] += losses['param_loss'].item()
-                        val_losses['image'] += losses['image_loss'].item()
-                        val_losses['ssim'] += safe_item(losses['ssim'])
-                        val_fusion_weights['param'] += safe_item(outputs['param_fusion_weight'])
-                        val_fusion_weights['image'] += safe_item(outputs['image_fusion_weight'])
-                        val_contribs['param_ts'] += safe_item(outputs['param_time_series_contrib'])
-                        val_contribs['param_img'] += safe_item(outputs['param_image_contrib'])
-                        val_contribs['img_ts'] += safe_item(outputs['image_time_series_contrib'])
-                        val_contribs['img_img'] += safe_item(outputs['image_image_contrib'])
-                avg_val_total = val_losses['total'] / len(val_loader)
-                avg_val_param = val_losses['param'] / len(val_loader)
-                avg_val_image = val_losses['image'] / len(val_loader)
-                avg_val_ssim = val_losses['ssim'] / len(val_loader)
-                avg_val_param_weight = safe_item(val_fusion_weights['param'] / len(val_loader))
-                avg_val_image_weight = safe_item(val_fusion_weights['image'] / len(val_loader))
-                avg_val_param_ts_contrib = val_contribs['param_ts'] / len(val_loader)
-                avg_val_param_img_contrib = val_contribs['param_img'] / len(val_loader)
-                avg_val_img_ts_contrib = val_contribs['img_ts'] / len(val_loader)
-                avg_val_img_img_contrib = val_contribs['img_img'] / len(val_loader)
-                if epoch % 5 == 0:
-                    val_batch = next(iter(val_loader))
-                    val_btc, val_head, val_k_true, val_params = val_batch
-                    with torch.no_grad():
-                        val_outputs = model(val_btc[:4], val_head[:4])
-                        val_k_pred = val_outputs['k_field']
-                    comparison = torch.cat([val_k_true[:4], val_k_pred], dim=0)
-                    comparison_grid = make_grid(comparison, nrow=4, normalize=True)
-                    save_image(comparison_grid, f'samples/stage{stage + 1}_epoch{epoch + 1}_comparison.png')
-                scheduler.step(avg_val_total)
-                if avg_val_total < best_val_loss:
-                    best_val_loss = avg_val_total
-                    best_model_state = copy.deepcopy(model.state_dict())
-                    torch.save({
-                        'stage': stage + 1,
-                        'epoch': epoch + 1,
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'best_val_loss': best_val_loss,
-                        'param_fusion_weight': safe_item(avg_val_param_weight),
-                        'image_fusion_weight': safe_item(avg_val_image_weight)
-                    }, 'checkpoints/best_residual_fusion_model.pth')
-                    print(f"New best model saved with val_loss: {avg_val_total:.4f}")
-                    stage_patience = 0
-                else:
-                    stage_patience += 1
-                    if stage_patience >= patience:
-                        print(f"Early stopping at stage {stage + 1}, epoch {epoch + 1}")
-                        break
-                print(
-                    f"Stage {stage + 1} Epoch {epoch + 1} | "
-                    f"Train Loss: {avg_train_total:.4f} (P:{avg_train_param:.4f}, I:{avg_train_image:.4f}) | "
-                    f"Val Loss: {avg_val_total:.4f} (P:{avg_val_param:.4f}, I:{avg_val_image:.4f}) | "
-                    f"Fusion Weights - Param: {safe_item(avg_val_param_weight):.4f}, Image: {safe_item(avg_val_image_weight):.4f} | "
-                    f"Param Contribs - TS: {avg_val_param_ts_contrib:.4f}, Img: {avg_val_param_img_contrib:.4f} | "
-                    f"Image Contribs - TS: {avg_val_img_ts_contrib:.4f}, Img: {avg_val_img_img_contrib:.4f} | "
-                    f"Val SSIM: {avg_val_ssim:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f}"
-                )
-            except Exception as e:
-                print(f"Error during training: {e}")
-                import traceback
-                traceback.print_exc()
-                continue
+
+        for btc, head_img, k_field, params in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs}"):
+            optimizer.zero_grad()
+            outputs = model(btc, head_img)
+            losses = combined_loss_function(outputs, params, k_field, loss_weights)
+            losses['total_loss'].backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            train_losses['total'] += losses['total_loss'].item()
+            train_losses['param'] += losses['param_loss'].item()
+            train_losses['image'] += losses['image_loss'].item()
+
+            fusion_weights['param'] += safe_item(outputs['param_fusion_weight'])
+            fusion_weights['image'] += safe_item(outputs['image_fusion_weight'])
+
+            contribs['param_ts'] += safe_item(outputs['param_time_series_contrib'])
+            contribs['param_img'] += safe_item(outputs['param_image_contrib'])
+            contribs['img_ts'] += safe_item(outputs['image_time_series_contrib'])
+            contribs['img_img'] += safe_item(outputs['image_image_contrib'])
+
+        avg_train_total = train_losses['total'] / len(train_loader)
+        avg_train_param = train_losses['param'] / len(train_loader)
+        avg_train_image = train_losses['image'] / len(train_loader)
+        avg_param_weight = fusion_weights['param'] / len(train_loader)
+        avg_image_weight = fusion_weights['image'] / len(train_loader)
+        avg_param_ts_contrib = contribs['param_ts'] / len(train_loader)
+        avg_param_img_contrib = contribs['param_img'] / len(train_loader)
+        avg_img_ts_contrib = contribs['img_ts'] / len(train_loader)
+        avg_img_img_contrib = contribs['img_img'] / len(train_loader)
+
+        # 记录训练历史
+        history['train_total_loss'].append(avg_train_total)
+        history['train_param_loss'].append(avg_train_param)
+        history['train_image_loss'].append(avg_train_image)
+        history['lr'].append(optimizer.param_groups[0]['lr'])
+        history['param_fusion_weight'].append(avg_param_weight)
+        history['image_fusion_weight'].append(avg_image_weight)
+        history['param_time_series_contrib'].append(avg_param_ts_contrib)
+        history['param_image_contrib'].append(avg_param_img_contrib)
+        history['image_time_series_contrib'].append(avg_img_ts_contrib)
+        history['image_image_contrib'].append(avg_img_img_contrib)
+
+        # 验证阶段
+        model.eval()
+        val_losses = {'total': 0.0, 'param': 0.0, 'image': 0.0, 'ssim': 0.0}
+        val_fusion_weights = {'param': 0.0, 'image': 0.0}
+        val_contribs = {
+            'param_ts': 0.0, 'param_img': 0.0,
+            'img_ts': 0.0, 'img_img': 0.0
+        }
+
+        with torch.no_grad():
+            for btc, head_img, k_field, params in val_loader:
+                outputs = model(btc, head_img)
+                losses = combined_loss_function(outputs, params, k_field, loss_weights)
+
+                val_losses['total'] += losses['total_loss'].item()
+                val_losses['param'] += losses['param_loss'].item()
+                val_losses['image'] += losses['image_loss'].item()
+                val_losses['ssim'] += safe_item(losses['ssim'])
+
+                val_fusion_weights['param'] += safe_item(outputs['param_fusion_weight'])
+                val_fusion_weights['image'] += safe_item(outputs['image_fusion_weight'])
+
+                val_contribs['param_ts'] += safe_item(outputs['param_time_series_contrib'])
+                val_contribs['param_img'] += safe_item(outputs['param_image_contrib'])
+                val_contribs['img_ts'] += safe_item(outputs['image_time_series_contrib'])
+                val_contribs['img_img'] += safe_item(outputs['image_image_contrib'])
+
+        avg_val_total = val_losses['total'] / len(val_loader)
+        avg_val_param = val_losses['param'] / len(val_loader)
+        avg_val_image = val_losses['image'] / len(val_loader)
+        avg_val_ssim = val_losses['ssim'] / len(val_loader)
+
+        # 记录验证指标
+        history['val_total_loss'].append(avg_val_total)
+        history['val_param_loss'].append(avg_val_param)
+        history['val_image_loss'].append(avg_val_image)
+
+        # 更新学习率
+        scheduler.step(avg_val_total)
+
+        # 保存样本预测结果
+        if epoch % 5 == 0:
+            from torchvision.utils import make_grid, save_image
+            val_batch = next(iter(val_loader))
+            val_btc, val_head, val_k_true, val_params = val_batch
+            with torch.no_grad():
+                val_outputs = model(val_btc[:4], val_head[:4])
+                val_k_pred = val_outputs['k_field']
+
+            comparison = torch.cat([val_k_true[:4], val_k_pred], dim=0)
+            comparison_grid = make_grid(comparison, nrow=4, normalize=True)
+            save_image(comparison_grid, f'samples/onestage_epoch{epoch + 1}_comparison.png')
+
+        # 保存最佳模型
+        if avg_val_total < best_val_loss:
+            best_val_loss = avg_val_total
+            best_model_state = copy.deepcopy(model.state_dict())
+
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'best_val_loss': best_val_loss,
+                'param_fusion_weight': safe_item(val_fusion_weights['param'] / len(val_loader)),
+                'image_fusion_weight': safe_item(val_fusion_weights['image'] / len(val_loader))
+            }, 'checkpoints/best_fusion_model.pth')
+
+            print(f"New best model saved with val_loss: {avg_val_total:.4f}")
+            waiting = 0
+        else:
+            waiting += 1
+            if waiting >= patience:
+                print(f"Early stopping at epoch {epoch + 1}")
+                break
+
+        # 输出训练信息
+        avg_val_param_weight = val_fusion_weights['param'] / len(val_loader)
+        avg_val_image_weight = val_fusion_weights['image'] / len(val_loader)
+        avg_val_param_ts_contrib = val_contribs['param_ts'] / len(val_loader)
+        avg_val_param_img_contrib = val_contribs['param_img'] / len(val_loader)
+        avg_val_img_ts_contrib = val_contribs['img_ts'] / len(val_loader)
+        avg_val_img_img_contrib = val_contribs['img_img'] / len(val_loader)
+
+        print(
+            f"Epoch {epoch + 1}/{epochs} | "
+            f"Train Loss: {avg_train_total:.4f} (P:{avg_train_param:.4f}, I:{avg_train_image:.4f}) | "
+            f"Val Loss: {avg_val_total:.4f} (P:{avg_val_param:.4f}, I:{avg_val_image:.4f}) | "
+            f"Fusion Weights - Param: {avg_val_param_weight:.4f}, Image: {avg_val_image_weight:.4f} | "
+            f"Param Contribs - TS: {avg_val_param_ts_contrib:.4f}, Img: {avg_val_param_img_contrib:.4f} | "
+            f"Image Contribs - TS: {avg_val_img_ts_contrib:.4f}, Img: {avg_val_img_img_contrib:.4f} | "
+            f"Val SSIM: {avg_val_ssim:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f}"
+        )
+
+    # 加载最佳模型
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
+
+    # 评估模型
     evaluate_residual_fusion_model(model, test_loader, scaler_Y)
     plot_training_history(history)
+
     return model, history
+
 
 def evaluate_residual_fusion_model(model, test_loader, scaler_Y):
     print("\nEvaluating on test set...")
@@ -884,7 +913,7 @@ def plot_training_history(history):
     plt.xlabel('Epoch')
     plt.ylabel('LR')
     plt.tight_layout()
-    plt.savefig('residual_fusion_training_history.png')
+    plt.savefig('residual_fusion_training_history_onestage.png')
     plt.close()
 
 def plot_parameter_predictions(test_true, test_preds, r2_scores):
@@ -898,7 +927,7 @@ def plot_parameter_predictions(test_true, test_preds, r2_scores):
         plt.xlabel('True')
         plt.ylabel('Predicted')
     plt.tight_layout()
-    plt.savefig('residual_fusion_parameter_predictions.png')
+    plt.savefig('residual_fusion_parameter_predictions_onestage.png')
     plt.close()
 
 def plot_sample_images(model, data_loader):
@@ -936,7 +965,7 @@ def plot_sample_images(model, data_loader):
             plt.title(f'Predicted K-Field (FW: {fw_value:.2f})')
             plt.axis('off')
         plt.tight_layout()
-        plt.savefig('residual_fusion_sample_predictions.png')
+        plt.savefig('residual_fusion_sample_predictions_onestage.png')
         plt.close()
 
 def main():
@@ -952,16 +981,16 @@ def main():
         print(f"Loaded parameters shape: {Y.shape}")
         print(f"Loaded head images shape: {head_images.shape}")
         print(f"Loaded K field images shape: {k_field_images.shape}")
-        model, history = train_residual_fusion_model(
+
+        model, history = train_onestage_fusion_model(
             X_time_series=X_time_series,
             head_images=head_images,
             k_field_images=k_field_images,
             Y=Y,
             lstm_path='best_specialized_model.pth',
             cnn_path='checkpoints/best_model.pth',
-            stages=3,
-            epochs_per_stage=30,
-            patience=20,
+            epochs=50,
+            patience=15,
             batch_size=32
         )
         print("Training completed!")
